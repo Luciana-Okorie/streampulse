@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# Build output
+frontend/.next/
+api/api
+processor/processor
+
+# Environment
+.env
+
+# Go
+*.exe
+*.test
+
+# Local test artifacts
+event.json
+build.log
+
+# OS
+.DS_Store
+Thumbs.db

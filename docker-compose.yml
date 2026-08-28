@@ -1,0 +1,161 @@
+# StreamPulse — Day 10
+# Host ports are chosen to avoid collisions with other locally-running
+# coding-challenge projects (see dev-ports registry). Internal container
+# ports use the standard defaults for each technology.
+
+services:
+  # ---------------------------------------------------------------------
+  # Kafka (KRaft mode — no Zookeeper needed)
+  # ---------------------------------------------------------------------
+  # Using the official Apache Kafka image (KRaft mode, no Zookeeper) instead
+  # of bitnami/kafka — Bitnami removed most free-tier tags from Docker Hub
+  # in 2025, so that image no longer resolves.
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: streampulse-kafka
+    ports:
+      - "9093:9094" # host -> external (PLAINTEXT_HOST) listener
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  kafka-init:
+    image: apache/kafka:3.7.0
+    container_name: streampulse-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: >
+      "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic events --partitions 6 --replication-factor 1"
+
+  # ---------------------------------------------------------------------
+  # Redis — live/temporary state (counters, active users, rate limits)
+  # ---------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: streampulse-redis
+    ports:
+      - "6400:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------
+  # ClickHouse — historical analytics store
+  # ---------------------------------------------------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: streampulse-clickhouse
+    ports:
+      - "8124:8123" # HTTP interface
+      - "9004:9000" # native TCP interface
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------
+  # OpenTelemetry Collector
+  # ---------------------------------------------------------------------
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.104.0
+    container_name: streampulse-otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector/otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4317:4317" # OTLP gRPC
+      - "4320:4318" # OTLP HTTP (4318 is already taken by CollabBoard's Jaeger)
+
+  # ---------------------------------------------------------------------
+  # Go event ingestion API
+  # ---------------------------------------------------------------------
+  api:
+    build: ./api
+    container_name: streampulse-api
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "4002:4002"
+    environment:
+      PORT: "4002"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_TOPIC: "events"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # Go stream processor (consumer -> Redis + ClickHouse + WebSocket hub)
+  # ---------------------------------------------------------------------
+  processor:
+    build: ./processor
+    container_name: streampulse-processor
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    ports:
+      - "4003:4003" # WebSocket server
+    environment:
+      WS_PORT: "4003"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_TOPIC: "events"
+      KAFKA_GROUP_ID: "streampulse-processor"
+      REDIS_ADDR: "redis:6379"
+      CLICKHOUSE_ADDR: "clickhouse:9000"
+      CLICKHOUSE_DB: "streampulse"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # Next.js dashboard
+  # ---------------------------------------------------------------------
+  frontend:
+    build: ./frontend
+    container_name: streampulse-frontend
+    depends_on:
+      - api
+      - processor
+    ports:
+      - "3003:3003"
+    environment:
+      PORT: "3003"
+      NEXT_PUBLIC_API_URL: "http://localhost:4002"
+      NEXT_PUBLIC_WS_URL: "ws://localhost:4003/ws"
+    restart: unless-stopped
+
+volumes:
+  kafka-data:
+  redis-data:
+  clickhouse-data:
