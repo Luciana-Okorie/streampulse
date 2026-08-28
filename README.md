@@ -1,4 +1,4 @@
-# StreamPulse — Day 10
+# StreamPulse
 
 Real-time event analytics and monitoring platform. Ingest events over HTTP,
 stream them through Kafka, aggregate live stats in Redis, persist history in
